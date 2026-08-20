@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+<meta charset="UTF-8">
+<title>E-Mail AI AGENT - مديرية مشروع ماء البصرة</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ===================== شاشة الإعداد الأول / الإعدادات ===================== -->
+<div id="setup-screen" class="screen hidden">
+  <header class="app-header">
+    <div class="brand">
+      <img src="assets/mascot.webp" class="brand-icon" alt="">
+      <span>E-Mail AI AGENT — مديرية مشروع ماء البصرة</span>
+    </div>
+    <div class="header-actions">
+      <button id="btn-theme-toggle-setup" class="btn btn-ghost" title="تبديل الوضع الليلي">🌙</button>
+      <button class="btn btn-teal tab-btn" data-tab="aliases">أسماء الأقسام</button>
+      <button class="btn btn-sky tab-btn" data-tab="chat">اسأل الوكيل</button>
+      <button class="btn btn-home tab-btn" data-tab="letters">الصفحة الرئيسية</button>
+      <button id="btn-scan-setup" class="btn btn-primary">فحص الآن</button>
+    </div>
+  </header>
+
+  <div class="setup-body">
+  <div class="setup-card">
+    <button type="button" id="btn-back-top" class="btn btn-ghost hidden setup-back-btn">→ رجوع</button>
+    <div class="setup-header">
+      <img src="assets/mascot.webp" class="setup-mascot" alt="">
+      <h1 id="setup-title">إعداد E-Mail AI AGENT</h1>
+    </div>
+
+    <div id="setup-error" class="alert alert-error hidden"></div>
+
+    <form id="setup-form">
+      <fieldset>
+        <legend>إعدادات البريد (IMAP)</legend>
+        <div class="field-row"><label>عنوان سيرفر البريد</label><input name="imap_host" required></div>
+        <div class="field-row"><label>المنفذ (Port)</label><input name="imap_port" type="number" required></div>
+        <div class="field-row"><label>البريد الإلكتروني</label><input name="imap_user" required></div>
+        <div class="field-row"><label>كلمة المرور</label><input name="imap_password" type="password" id="imap_password_field"></div>
+        <div class="field-row"><label>مجلد الوارد</label><input name="imap_inbox_folder" required></div>
+        <div class="field-row"><label>مجلد الصادر</label><input name="imap_sent_folder" required></div>
+        <div class="field-actions">
+          <button type="button" class="btn btn-ghost" id="btn-test-imap">اختبار الاتصال بالبريد</button>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>قاعدة البيانات (PostgreSQL)</legend>
+        <div class="field-row"><label>المضيف</label><input name="postgres_host" required></div>
+        <div class="field-row"><label>المنفذ</label><input name="postgres_port" type="number" required></div>
+        <div class="field-row"><label>اسم قاعدة البيانات</label><input name="postgres_db" required></div>
+        <div class="field-row"><label>المستخدم</label><input name="postgres_user" required></div>
+        <div class="field-row"><label>كلمة المرور</label><input name="postgres_password" type="password" id="postgres_password_field"></div>
+        <div class="field-actions">
+          <button type="button" class="btn btn-ghost" id="btn-test-pg">اختبار الاتصال بقاعدة البيانات</button>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Gemini API</legend>
+        <div class="field-row"><label>مفتاح API</label><input name="gemini_key" type="password" id="gemini_key_field"></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>التخزين والجدولة</legend>
+        <div class="field-row">
+          <label>مجلد التخزين الرئيسي</label>
+          <div class="input-with-button">
+            <input name="storage_root" required>
+            <button type="button" class="btn btn-ghost" id="btn-browse">استعراض...</button>
+          </div>
+        </div>
+        <div class="field-row"><label>الفحص التلقائي كل كم ساعة</label><input name="scan_interval_hours" type="number" required></div>
+        <div class="field-row checkbox-row">
+          <label><input type="checkbox" name="autostart_enabled"> التشغيل التلقائي عند بدء ويندوز والعمل في الخلفية</label>
+        </div>
+      </fieldset>
+
+      <div class="setup-submit">
+        <button type="submit" class="btn btn-primary btn-lg">حفظ وبدء التشغيل</button>
+        <button type="button" class="btn btn-ghost hidden" id="btn-cancel-settings">إلغاء</button>
+      </div>
+    </form>
+  </div>
+  </div>
+
+  <footer class="app-footer">
+    <p class="copyright">© 2026 Huda Elmuthefer — جميع الحقوق محفوظة</p>
+  </footer>
+</div>
+
+<!-- ===================== الواجهة الرئيسية ===================== -->
+<div id="app-screen" class="screen hidden">
+  <header class="app-header">
+    <div class="brand">
+      <img src="assets/mascot.webp" class="brand-icon" alt="">
+      <span>E-Mail AI AGENT — مديرية مشروع ماء البصرة</span>
+    </div>
+    <div class="header-actions">
+      <button id="btn-theme-toggle" class="btn btn-ghost" title="تبديل الوضع الليلي">🌙</button>
+      <button id="btn-open-settings" class="btn btn-ghost">الإعدادات</button>
+      <button class="btn btn-teal tab-btn" data-tab="aliases">أسماء الأقسام</button>
+      <button class="btn btn-sky tab-btn" data-tab="chat">اسأل الوكيل</button>
+      <button class="btn btn-home tab-btn active" data-tab="letters">الصفحة الرئيسية</button>
+      <button id="btn-scan" class="btn btn-primary">فحص الآن</button>
+    </div>
+  </header>
+
+  <div id="status-bar" class="status-bar">جاهز</div>
+
+  <section class="hero-banner">
+    <img src="assets/banner.png" class="hero-banner-img" alt="">
+  </section>
+
+  <main class="app-main">
+    <section class="welcome-banner">
+      <div class="welcome-text">
+        <h1>مرحباً بك في مساعد البريد الذكي لمشروع ماء البصرة</h1>
+        <p class="hero-tagline">كل قطرة لها قيمة، وكل رسالة لها أثر… أهلاً بك</p>
+      </div>
+    </section>
+
+    <section class="stats-row">
+      <div class="stat-card">
+        <div class="stat-icon icon-blue">📥</div>
+        <div class="stat-value" id="stat-incoming">—</div>
+        <div class="stat-label">وارد اليوم</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon icon-orange">📤</div>
+        <div class="stat-value" id="stat-outgoing">—</div>
+        <div class="stat-label">صادر اليوم</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon icon-teal">🕒</div>
+        <div class="stat-value" id="stat-last-scan">—</div>
+        <div class="stat-label">آخر فحص</div>
+      </div>
+    </section>
+
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="letters">الكتب المؤرشفة</button>
+    </nav>
+
+    <section id="tab-letters" class="tab-panel active">
+      <div class="filter-bar">
+        <button class="btn btn-primary" id="btn-search-letters">بحث</button>
+        <select id="filter-direction">
+          <option value="">الكل</option>
+          <option value="incoming">وارد</option>
+          <option value="outgoing">صادر</option>
+        </select>
+        <input id="search-keyword" placeholder="بحث بالعنوان أو الموضوع...">
+      </div>
+      <div class="table-wrap">
+        <table id="letters-table">
+          <thead>
+            <tr>
+              <th>العنوان</th><th>الاتجاه</th><th>القسم</th><th>التاريخ</th><th>من</th><th>إلى</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="letters-tbody"></tbody>
+        </table>
+      </div>
+      <div class="pagination" id="letters-pagination">
+        <button class="btn btn-ghost" id="btn-prev-page">السابق</button>
+        <span id="page-indicator" class="page-indicator"></span>
+        <button class="btn btn-ghost" id="btn-next-page">التالي</button>
+      </div>
+    </section>
+
+    <section id="tab-chat" class="tab-panel">
+      <div class="chat-card">
+        <div id="chat-display" class="chat-display">
+          <div id="chat-empty" class="chat-empty">
+            <div class="chat-empty-icon">💬</div>
+            <p>اسأل الوكيل عن الكتب المؤرشفة، وستظهر المحادثة والردود هنا</p>
+          </div>
+        </div>
+        <div id="chat-results" class="chat-results"></div>
+        <div class="chat-input-bar">
+          <button class="btn btn-primary" id="btn-send-chat">إرسال</button>
+          <input id="chat-input" placeholder="اسأل عن الكتب... مثال: كم كتاب صادر اليوم؟">
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-aliases" class="tab-panel">
+      <p class="hint-text">أسماء الأقسام تُستخدم عند عدم وجود اسم واضح في بريد المرسل/المستلم. التعديلات تنطبق على عمليات الفحص القادمة فقط.</p>
+      <div class="table-wrap">
+        <table id="aliases-table">
+          <thead><tr><th>البريد الإلكتروني</th><th>اسم القسم</th><th></th></tr></thead>
+          <tbody id="aliases-tbody"></tbody>
+        </table>
+      </div>
+      <div class="filter-bar">
+        <button class="btn btn-primary" id="btn-save-alias">حفظ/تحديث</button>
+        <input id="alias-department" placeholder="اسم القسم بالعربي">
+        <input id="alias-email" placeholder="example@mowr.gov.iq">
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <p class="copyright">© 2026 Huda Elmuthefer — جميع الحقوق محفوظة</p>
+  </footer>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
