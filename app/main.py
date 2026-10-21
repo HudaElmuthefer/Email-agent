@@ -55,6 +55,8 @@ logging.getLogger("pywebview").setLevel(logging.CRITICAL)
 
 stop_event = threading.Event()
 
+FAILED_SCAN_RETRY_SECONDS = 15 * 60
+
 if getattr(sys, "frozen", False):
     WEB_DIR = Path(sys._MEIPASS) / "app" / "web"
 else:
@@ -71,9 +73,16 @@ def scheduler_loop(api: Api):
         settings = config.load_settings()
         interval_seconds = max(settings.scan_interval_hours, 1) * 3600
         try:
-            api.scan_now()
+            ok = api.scan_now().get("ok", False)
         except Exception:
             logger.exception("Scheduled sync failed")
+            ok = False
+        # A failed scan (no network yet at boot, mail server dropping the
+        # connection) used to wait the full interval (24h) before trying
+        # again, so mail went unarchived for a whole day.
+        if not ok:
+            interval_seconds = min(interval_seconds, FAILED_SCAN_RETRY_SECONDS)
+            logger.info("Scheduled scan failed; retrying in %ds", interval_seconds)
         stop_event.wait(interval_seconds)
 
 
@@ -179,7 +188,13 @@ def run_worker():
 
 MAX_WORKER_RESTARTS = 20
 HANG_CHECK_INTERVAL_SECONDS = 5
-HANG_CONFIRM_COUNT = 3
+# IsHungAppWindow reports a window as hung after only ~5s without pumping
+# messages, which routinely happens during WebView2 startup and while a scan
+# is busy. With the old 15s threshold the worker was being killed every
+# 20-40s (supervisor.log), aborting every scan mid-way. A genuine native hang
+# never recovers, so waiting longer still catches it.
+HANG_STARTUP_GRACE_SECONDS = 90
+HANG_CONFIRM_COUNT = 24  # ~2 minutes of continuous unresponsiveness
 
 
 def _watch_for_hang(proc: subprocess.Popen, stop_flag: threading.Event):
@@ -194,6 +209,8 @@ def _watch_for_hang(proc: subprocess.Popen, stop_flag: threading.Event):
     its own — so this watchdog force-kills it after a sustained hang, which
     lets the normal restart loop take over exactly as it would for a crash.
     """
+    if stop_flag.wait(HANG_STARTUP_GRACE_SECONDS):
+        return
     hung_streak = 0
     while not stop_flag.wait(HANG_CHECK_INTERVAL_SECONDS):
         if proc.poll() is not None:
@@ -204,7 +221,8 @@ def _watch_for_hang(proc: subprocess.Popen, stop_flag: threading.Event):
             continue
         if ctypes.windll.user32.IsHungAppWindow(hwnd):
             hung_streak += 1
-            logger.warning("Worker window unresponsive (%d/%d checks)", hung_streak, HANG_CONFIRM_COUNT)
+            if hung_streak % 6 == 0:
+                logger.warning("Worker window unresponsive (%d/%d checks)", hung_streak, HANG_CONFIRM_COUNT)
             if hung_streak >= HANG_CONFIRM_COUNT:
                 logger.error("Worker window hung for too long; force-killing it so the supervisor can restart it.")
                 try:

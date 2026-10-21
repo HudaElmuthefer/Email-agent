@@ -223,7 +223,8 @@ async function pollScanStatus() {
   const result = await api().get_scan_status();
   const text = result.status;
   if (text === lastScanStatus) return;
-  const justCompleted = text.startsWith("اكتمل") && lastScanStatus !== null;
+  // A failed scan may still have archived some letters before stopping.
+  const justCompleted = (text.startsWith("اكتمل") || text.startsWith("تعذر")) && lastScanStatus !== null;
   lastScanStatus = text;
   setStatus(text);
   if (justCompleted) {

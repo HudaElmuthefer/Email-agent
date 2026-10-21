@@ -29,13 +29,38 @@ FALLBACK_MODEL = "gemini-flash-latest"
 TRANSIENT_STATUS_CODES = {503}
 MAX_TRANSIENT_RETRIES = 2
 
+# 429 RESOURCE_EXHAUSTED on the free tier is a per-model quota (e.g. 20
+# requests/day for the flash model — confirmed in agent.log). Other models
+# have their own separate quota, so on 429 we move on to the next model here
+# instead of failing. Models that don't exist for the key are skipped.
+QUOTA_FALLBACK_MODELS = [
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+DEFAULT_QUOTA_COOLDOWN_SECONDS = 3600
 
-def generate_content_safe(client: genai.Client, model: str, contents, **kwargs):
-    """Calls generate_content. Retries with FALLBACK_MODEL if the configured
-    model has been retired (Google periodically deprecates dated model
-    names), persisting the fix so future calls skip the retry. Also retries
-    a couple of times, with a short backoff, on a transient server-side 503
-    (see TRANSIENT_STATUS_CODES above) before giving up."""
+# model name -> time.time() until which it is known to be out of quota, so
+# later calls (e.g. the rest of a sync run) don't waste a request on it.
+_exhausted_until: dict[str, float] = {}
+
+
+class QuotaExhaustedError(Exception):
+    """Every candidate Gemini model is currently out of quota."""
+
+    def __init__(self, retry_after_seconds: float):
+        super().__init__(f"Gemini quota exhausted for all models; retry in {int(retry_after_seconds)}s")
+        self.retry_after_seconds = retry_after_seconds
+
+
+def _parse_retry_delay(message: str) -> float:
+    match = re.search(r"retryDelay'?\"?:\s*'?\"?(\d+(?:\.\d+)?)s", message)
+    return float(match.group(1)) if match else DEFAULT_QUOTA_COOLDOWN_SECONDS
+
+
+def _generate_with_model(client: genai.Client, model: str, contents, **kwargs):
+    """One model, with retries for transient 503 and the retired-model fix."""
     current_model = model
     for attempt in range(MAX_TRANSIENT_RETRIES + 1):
         try:
@@ -59,6 +84,40 @@ def generate_content_safe(client: genai.Client, model: str, contents, **kwargs):
                 time.sleep(wait_seconds)
                 continue
             raise
+
+
+def generate_content_safe(client: genai.Client, model: str, contents, **kwargs):
+    """Calls generate_content. Retries with FALLBACK_MODEL if the configured
+    model has been retired (Google periodically deprecates dated model
+    names), persisting the fix so future calls skip the retry. Also retries
+    a couple of times, with a short backoff, on a transient server-side 503
+    (see TRANSIENT_STATUS_CODES above) before giving up. On 429 quota
+    exhaustion it moves on to the next model in QUOTA_FALLBACK_MODELS, and
+    raises QuotaExhaustedError once every candidate is out of quota."""
+    candidates = [model] + [m for m in QUOTA_FALLBACK_MODELS if m != model]
+    soonest_retry: float | None = None
+    for candidate in candidates:
+        now = time.time()
+        until = _exhausted_until.get(candidate, 0)
+        if until > now:
+            soonest_retry = min(soonest_retry or until - now, until - now)
+            continue
+        try:
+            return _generate_with_model(client, candidate, contents, **kwargs)
+        except Exception as exc:
+            message = str(exc)
+            status_code = getattr(exc, "code", None)
+            if status_code == 429 or "RESOURCE_EXHAUSTED" in message:
+                delay = _parse_retry_delay(message)
+                _exhausted_until[candidate] = time.time() + delay
+                soonest_retry = min(soonest_retry or delay, delay)
+                logger.warning("Gemini quota exhausted for %s (retry in %ds); trying next model", candidate, delay)
+                continue
+            if candidate != model and (status_code == 404 or "NOT_FOUND" in message):
+                logger.warning("Fallback model %s not available; skipping", candidate)
+                continue
+            raise
+    raise QuotaExhaustedError(soonest_retry or DEFAULT_QUOTA_COOLDOWN_SECONDS)
 
 TITLE_PROMPT = """أنت موظف أرشفة (document controller) في دائرة حكومية عراقية. لديك محتوى مستند من كتاب رسمي.
 مهمتك: استخرج عنواناً قصيراً مناسباً لتسمية الملف به.
@@ -130,9 +189,15 @@ def pick_primary_attachment(attachments: list[Attachment]) -> Attachment:
     return attachments[0]
 
 
+# Without a timeout a stalled request blocks the scan forever (and, via the
+# scan lock, every later scan too). Legitimate requests uploading a scanned
+# PDF over this connection have been seen taking up to ~5.5 minutes.
+GEMINI_TIMEOUT_MS = 8 * 60 * 1000
+
+
 def build_client() -> genai.Client:
     api_key = config.get_secret(config.KEY_GEMINI_API_KEY)
-    return genai.Client(api_key=api_key)
+    return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
 
 
 def _ask_gemini(client: genai.Client, model: str, prompt: str, attachment: Attachment | None) -> str:

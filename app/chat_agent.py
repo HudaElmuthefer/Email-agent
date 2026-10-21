@@ -148,6 +148,15 @@ class ChatAgent:
                 self.client, self.model, question, config=gen_config
             )
             text = (response.text or "").strip() or "لم أتمكن من إيجاد إجابة."
+        except classifier.QuotaExhaustedError as exc:
+            logger.warning("Chat agent: %s", exc)
+            hours, rem = divmod(int(exc.retry_after_seconds), 3600)
+            minutes = rem // 60
+            text = (
+                "تم استهلاك الحصة اليومية المجانية لمفتاح Gemini API. "
+                f"يمكن المحاولة مجدداً بعد حوالي {hours} ساعة و{minutes} دقيقة، "
+                "أو تفعيل الفوترة (Billing) لمفتاح Gemini من Google AI Studio لرفع الحد."
+            )
         except Exception:
             logger.exception("Chat agent request failed")
             text = "حدث خطأ أثناء التواصل مع Gemini. الرجاء المحاولة مرة أخرى."

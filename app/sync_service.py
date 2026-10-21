@@ -1,3 +1,4 @@
+import imaplib
 import logging
 import threading
 from datetime import datetime
@@ -67,39 +68,70 @@ def _run_sync_cycle_locked(report: Callable[[str], None]) -> int:
     db.ensure_schema()
     client = classifier.build_client()
 
-    report("جاري الاتصال بالبريد الإلكتروني...")
-    imap_conn = email_sync.connect()
+    folders = [
+        (settings.imap_inbox_folder, "incoming"),
+        (settings.imap_sent_folder, "outgoing"),
+    ]
     archived = 0
+    failed_folders = []
+    with db.get_connection() as conn:
+        for folder, direction in folders:
+            try:
+                archived += _sync_folder(conn, client, settings, folder, direction, report)
+            except Exception:
+                # One folder failing (e.g. network drop) must not stop the
+                # other folder from being scanned.
+                logger.exception("Sync of folder %s failed", folder)
+                failed_folders.append(folder)
+
+    if failed_folders:
+        raise RuntimeError(
+            f"فشل الاتصال أثناء فحص {', '.join(failed_folders)} (تم أرشفة {archived} كتاب)، ستتم إعادة المحاولة تلقائياً."
+        )
+
+    db.set_meta("last_scan_at", datetime.now().isoformat())
+    report(f"اكتمل الفحص. تم أرشفة {archived} كتاب جديد.")
+    return archived
+
+
+def _fetch_folder(folder: str, direction: str, last_uid: int, own_email: str) -> list[email_sync.FetchedMessage]:
+    """Downloads the folder's new messages on a short-lived IMAP connection.
+    The connection must not be held open while messages are processed:
+    each Gemini call takes minutes, and the mail server drops idle sessions
+    long before a full folder is done (seen in agent.log as
+    "IMAP4.abort: socket error: EOF" on the next folder's SELECT)."""
+    imap_conn = email_sync.connect()
     try:
-        folders = [
-            (settings.imap_inbox_folder, "incoming"),
-            (settings.imap_sent_folder, "outgoing"),
-        ]
-        with db.get_connection() as conn:
-            for folder, direction in folders:
-                last_uid = db.get_last_uid(conn, folder)
-                report(f"جاري فحص مجلد {folder}...")
-                messages = email_sync.fetch_new_messages(
-                    imap_conn, folder, direction, last_uid, settings.imap_user
-                )
-                max_uid = last_uid
-                for msg in messages:
-                    max_uid = max(max_uid, msg.imap_uid)
-                    if not msg.attachments:
-                        continue
-                    try:
-                        process_message(conn, client, settings.gemini_model, settings.storage_root, msg)
-                        archived += 1
-                        report(f"تمت أرشفة: {msg.subject or msg.department}")
-                    except Exception:
-                        logger.exception("Failed to process message uid=%s in %s", msg.imap_uid, folder)
-                db.set_last_uid(conn, folder, max_uid)
+        return email_sync.fetch_new_messages(imap_conn, folder, direction, last_uid, own_email)
     finally:
         try:
             imap_conn.logout()
         except Exception:
             pass
 
-    db.set_meta("last_scan_at", datetime.now().isoformat())
-    report(f"اكتمل الفحص. تم أرشفة {archived} كتاب جديد.")
+
+def _sync_folder(conn, client, settings, folder: str, direction: str, report: Callable[[str], None]) -> int:
+    last_uid = db.get_last_uid(conn, folder)
+    report(f"جاري الاتصال بالبريد وفحص مجلد {folder}...")
+    try:
+        messages = _fetch_folder(folder, direction, last_uid, settings.imap_user)
+    except (OSError, imaplib.IMAP4.abort):
+        logger.warning("IMAP fetch of %s failed; retrying once", folder, exc_info=True)
+        messages = _fetch_folder(folder, direction, last_uid, settings.imap_user)
+
+    archived = 0
+    for msg in sorted(messages, key=lambda m: m.imap_uid):
+        # Already archived by an earlier scan that was interrupted before it
+        # saved its progress: skip it instead of writing duplicate files and
+        # spending Gemini quota on it again.
+        if msg.attachments and not db.letter_exists(conn, folder, msg.imap_uid):
+            try:
+                process_message(conn, client, settings.gemini_model, settings.storage_root, msg)
+                archived += 1
+                report(f"تمت أرشفة: {msg.subject or msg.department}")
+            except Exception:
+                logger.exception("Failed to process message uid=%s in %s", msg.imap_uid, folder)
+        # Save progress after every message so an interrupted scan resumes
+        # where it stopped rather than redoing the whole folder.
+        db.set_last_uid(conn, folder, msg.imap_uid)
     return archived

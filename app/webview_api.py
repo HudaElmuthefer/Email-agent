@@ -24,12 +24,18 @@ class Api:
     JSON-serializable data (dict/list/str/int/bool/None)."""
 
     def __init__(self):
-        self.window = None
+        # Must stay underscore-prefixed: pywebview recursively walks every
+        # public attribute of the js_api object to build the JS bridge. A
+        # public `window` made it walk into the native WebView2/.NET window,
+        # issuing COM calls to the UI thread while holding the GIL that the
+        # UI thread was itself waiting on: a deadlock that froze the window
+        # right after startup until the watchdog killed it, aborting scans.
+        self._window = None
         self._chat_agent = None
         self._scan_status = "جاهز"
 
     def set_window(self, window):
-        self.window = window
+        self._window = window
 
     # ---------- setup / settings ----------
     def get_setup_status(self):
@@ -144,9 +150,9 @@ class Api:
             return {"ok": False, "message": f"تعذر الاتصال بقاعدة البيانات: {exc}"}
 
     def browse_storage_folder(self):
-        if not self.window:
+        if not self._window:
             return None
-        result = self.window.create_file_dialog(webview.FileDialog.FOLDER)
+        result = self._window.create_file_dialog(webview.FileDialog.FOLDER)
         if not result:
             return None
         return result[0]
@@ -209,6 +215,7 @@ class Api:
             return {"ok": True, "archived": count}
         except Exception as exc:
             logger.exception("scan_now failed")
+            self._scan_status = f"تعذر إكمال الفحص: {exc}"
             return {"ok": False, "error": str(exc)}
 
     def scan_now_async(self):

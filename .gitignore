@@ -185,3 +185,5 @@ dist/
 *.spec
 متطلبات_التشغيل/
 *.exe
+# Keep the project's own PyInstaller spec
+!build.spec

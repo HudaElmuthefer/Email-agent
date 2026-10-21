@@ -98,6 +98,15 @@ def set_last_uid(conn, imap_folder: str, last_uid: int) -> None:
     conn.commit()
 
 
+def letter_exists(conn, imap_folder: str, imap_uid: int) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM letters WHERE imap_folder = %s AND imap_uid = %s LIMIT 1",
+            (imap_folder, imap_uid),
+        )
+        return cur.fetchone() is not None
+
+
 def get_meta(key: str) -> str | None:
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT value FROM app_meta WHERE key = %s", (key,))
