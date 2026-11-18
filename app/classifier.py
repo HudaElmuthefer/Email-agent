@@ -1,7 +1,9 @@
 import io
+import json
 import logging
 import re
 import time
+from datetime import date
 
 import openpyxl
 from docx import Document
@@ -119,11 +121,15 @@ def generate_content_safe(client: genai.Client, model: str, contents, **kwargs):
             raise
     raise QuotaExhaustedError(soonest_retry or DEFAULT_QUOTA_COOLDOWN_SECONDS)
 
-TITLE_PROMPT = """أنت موظف أرشفة (document controller) في دائرة حكومية عراقية. لديك محتوى مستند من كتاب رسمي.
-مهمتك: استخرج عنواناً قصيراً مناسباً لتسمية الملف به.
-القاعدة: إذا وجدت في النص عبارة تبدأ بـ "م/" أو "الموضوع:" أو "الموضوع/"، استخدم النص الذي يليها مباشرة كعنوان (اختصره إذا كان طويلاً جداً مع الحفاظ على المعنى).
-إذا لم تجد مثل هذه العبارة، لخّص موضوع الكتاب في عبارة عربية قصيرة (٣ إلى ٨ كلمات) تدل على محتواه.
-أعد فقط نص العنوان بدون أي شرح إضافي، بدون علامات اقتباس، وبدون الأحرف: \\ / : * ? " < > |
+# Title for naming the file, plus the letter's number (العدد) and date for
+# duplicate detection, in one request so detection costs no extra Gemini quota.
+ANALYZE_PROMPT = """أنت موظف أرشفة (document controller) في دائرة حكومية عراقية. لديك محتوى مستند من كتاب رسمي.
+المطلوب ثلاثة أشياء:
+1) title: عنوان قصير مناسب لتسمية الملف به. إذا وجدت في النص عبارة تبدأ بـ "م/" أو "الموضوع:" أو "الموضوع/"، استخدم النص الذي يليها مباشرة كعنوان (اختصره إذا كان طويلاً جداً مع الحفاظ على المعنى). إذا لم تجد مثل هذه العبارة، لخّص موضوع الكتاب في عبارة عربية قصيرة (٣ إلى ٨ كلمات). بدون الأحرف: \\ / : * ? " < > |
+2) number: عدد الكتاب كما هو مكتوب في ترويسة الكتاب بجانب كلمة "العدد" أو "الرقم" (مثال: "ت/1234" أو "5678"). إن لم يوجد أعد "".
+3) date: تاريخ الكتاب المكتوب في الترويسة بجانب كلمة "التاريخ" بالصيغة YYYY-MM-DD (ميلادي). إن لم يوجد أعد "".
+لا تخلط بين عدد هذا الكتاب وأعداد الكتب المشار إليها في المتن (مثل "كتابكم المرقم ...").
+أعد JSON فقط بالشكل: {"title": "...", "number": "...", "date": "..."}
 """
 
 DISTINGUISH_PROMPT = """العنوان "{title}" مستخدم سابقاً لكتاب آخر بنفس القسم والاتجاه. ابحث في نص المستند أدناه عن رقم مرجعي أو رقم كتاب أو أي تفصيل يميز هذا الكتاب عن غيره (مثال: رقم، تسلسل، تاريخ مذكور بالنص).
@@ -200,7 +206,9 @@ def build_client() -> genai.Client:
     return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
 
 
-def _ask_gemini(client: genai.Client, model: str, prompt: str, attachment: Attachment | None) -> str:
+def _ask_gemini(
+    client: genai.Client, model: str, prompt: str, attachment: Attachment | None, **kwargs
+) -> str:
     contents = []
     ext = get_extension(attachment.filename) if attachment else ""
 
@@ -216,21 +224,53 @@ def _ask_gemini(client: genai.Client, model: str, prompt: str, attachment: Attac
     else:
         contents.append(prompt)
 
-    response = generate_content_safe(client, model, contents)
+    response = generate_content_safe(client, model, contents, **kwargs)
     return (response.text or "").strip()
 
 
-def generate_letter_title(
-    client: genai.Client, model: str, attachment: Attachment, subject_fallback: str
-) -> str:
+_DIGIT_TRANSLATION = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+
+
+def normalize_letter_number(raw: str) -> str | None:
+    """Reduces a letter number to its digit groups ("ت / ١٢٣٤" -> "1234",
+    "ق/12/345" -> "12/345") so the same number matches however Gemini spells
+    the prefix, spacing or digits. None when it holds no digits."""
+    groups = re.findall(r"\d+", (raw or "").translate(_DIGIT_TRANSLATION))
+    return "/".join(str(int(g)) for g in groups) if groups else None
+
+
+def _parse_letter_date(raw: str) -> date | None:
     try:
-        raw = _ask_gemini(client, model, TITLE_PROMPT, attachment)
-        title = sanitize_title(raw)
-        if title and title != "كتاب بدون عنوان":
-            return title
+        return date.fromisoformat((raw or "").translate(_DIGIT_TRANSLATION).strip())
+    except ValueError:
+        return None
+
+
+def analyze_letter(
+    client: genai.Client, model: str, attachment: Attachment, subject_fallback: str
+) -> tuple[str, str | None, date | None]:
+    """Returns (title, normalized letter number, letter date) read from the
+    attachment. Number/date are None when Gemini could not find them."""
+    fallback_title = sanitize_title(subject_fallback) if subject_fallback else "كتاب بدون عنوان"
+    try:
+        raw = _ask_gemini(
+            client, model, ANALYZE_PROMPT, attachment,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        data = json.loads(raw)
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        title = sanitize_title(str(data.get("title") or ""))
+        if title == "كتاب بدون عنوان":
+            title = fallback_title
+        return (
+            title,
+            normalize_letter_number(str(data.get("number") or "")),
+            _parse_letter_date(str(data.get("date") or "")),
+        )
     except Exception:
-        logger.exception("Gemini title generation failed, falling back to subject")
-    return sanitize_title(subject_fallback) if subject_fallback else "كتاب بدون عنوان"
+        logger.exception("Gemini letter analysis failed, falling back to subject")
+    return fallback_title, None, None
 
 
 def make_unique_title(

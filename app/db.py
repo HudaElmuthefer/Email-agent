@@ -46,6 +46,19 @@ CREATE INDEX IF NOT EXISTS idx_letters_department ON letters (department);
 CREATE INDEX IF NOT EXISTS idx_letters_direction ON letters (direction);
 CREATE INDEX IF NOT EXISTS idx_letters_email_date ON letters (email_date);
 CREATE INDEX IF NOT EXISTS idx_letters_title ON letters (title);
+
+-- SHA-256 of the attachment's bytes, used to detect the same file arriving
+-- again (in the same email or a later one) so it isn't archived/printed twice.
+-- '' marks an old row whose stored file could no longer be read.
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS content_hash TEXT;
+CREATE INDEX IF NOT EXISTS idx_attachments_content_hash ON attachments (content_hash);
+
+-- The letter's own number (العدد, digit groups only) and date as read from
+-- the document; together they identify a letter, so a match means it was
+-- already archived (and printed).
+ALTER TABLE letters ADD COLUMN IF NOT EXISTS letter_number TEXT;
+ALTER TABLE letters ADD COLUMN IF NOT EXISTS letter_date DATE;
+CREATE INDEX IF NOT EXISTS idx_letters_number_date ON letters (letter_number, letter_date);
 """
 
 
@@ -149,20 +162,24 @@ def insert_letter(
     imap_folder: str,
     imap_uid: int,
     attachments: list[dict],
+    letter_number: str | None = None,
+    letter_date: date | None = None,
 ) -> int:
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO letters
                 (direction, department, title, subject, source_email, dest_email,
-                 email_date, folder_path, primary_file_path, imap_folder, imap_uid)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 email_date, folder_path, primary_file_path, imap_folder, imap_uid,
+                 letter_number, letter_date)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (imap_folder, imap_uid) DO NOTHING
             RETURNING id
             """,
             (
                 direction, department, title, subject, source_email, dest_email,
                 email_date, folder_path, primary_file_path, imap_folder, imap_uid,
+                letter_number, letter_date,
             ),
         )
         row = cur.fetchone()
@@ -173,13 +190,69 @@ def insert_letter(
         for att in attachments:
             cur.execute(
                 """
-                INSERT INTO attachments (letter_id, original_filename, stored_path, file_type)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO attachments (letter_id, original_filename, stored_path, file_type, content_hash)
+                VALUES (%s, %s, %s, %s, %s)
                 """,
-                (letter_id, att["original_filename"], att["stored_path"], att.get("file_type")),
+                (
+                    letter_id, att["original_filename"], att["stored_path"],
+                    att.get("file_type"), att.get("content_hash"),
+                ),
             )
     conn.commit()
     return letter_id
+
+
+def find_attachment_by_hash(conn, content_hash: str) -> dict | None:
+    """Returns where a file with these exact bytes was archived before, or None."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT a.original_filename, a.stored_path, l.title, l.department,
+                   l.direction, l.email_date, l.subject
+            FROM attachments a JOIN letters l ON l.id = a.letter_id
+            WHERE a.content_hash = %s
+            ORDER BY l.email_date
+            LIMIT 1
+            """,
+            (content_hash,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def find_letter_by_number(conn, letter_number: str, letter_date: date) -> dict | None:
+    """Returns the earlier archived letter with this number and date, or None."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT title, department, direction, email_date, subject,
+                   primary_file_path AS stored_path
+            FROM letters
+            WHERE letter_number = %s AND letter_date = %s
+            ORDER BY email_date
+            LIMIT 1
+            """,
+            (letter_number, letter_date),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def backfill_attachment_hashes(conn, hash_file) -> int:
+    """Fills content_hash for attachments archived before duplicate detection
+    existed, by hashing their stored files. Runs once per row: a missing file
+    gets '' so it isn't retried on every scan."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, stored_path FROM attachments WHERE content_hash IS NULL")
+        rows = cur.fetchall()
+        for att_id, stored_path in rows:
+            try:
+                digest = hash_file(stored_path)
+            except OSError:
+                digest = ""
+            cur.execute("UPDATE attachments SET content_hash = %s WHERE id = %s", (digest, att_id))
+    conn.commit()
+    return len(rows)
 
 
 def count_letters(

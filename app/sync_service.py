@@ -4,16 +4,106 @@ import threading
 from datetime import datetime
 from typing import Callable
 
-from app import classifier, config, db, email_sync, file_organizer
+from app import classifier, config, db, duplicate_alert, email_sync, file_organizer
 
 logger = logging.getLogger(__name__)
 
 _scan_lock = threading.Lock()
 
+DIRECTION_LABELS = {"incoming": "وارد", "outgoing": "صادر"}
 
-def process_message(conn, client, model: str, storage_root: str, msg: email_sync.FetchedMessage) -> None:
+# Small images are almost always signature logos / inline pictures that every
+# email from the same sender carries; alarming on them would be pure noise.
+SMALL_IMAGE_BYTES = 50 * 1024
+
+
+def _is_small_image(att: email_sync.Attachment) -> bool:
+    return att.content_type.startswith("image/") and len(att.content) < SMALL_IMAGE_BYTES
+
+
+def _split_duplicates(conn, msg: email_sync.FetchedMessage):
+    """Returns (attachments to archive, alert lines for the duplicates dropped).
+    An attachment is a duplicate when the exact same bytes were already archived
+    (from any email) or appear earlier in this same email."""
+    keep, alerts = [], []
+    seen_in_message: dict[str, str] = {}
+    for att in msg.attachments:
+        if _is_small_image(att):
+            keep.append(att)
+            continue
+        digest = file_organizer.content_hash(att.content)
+        if digest in seen_in_message:
+            alerts.append(
+                f"• الملف «{att.filename}» مرفق أكثر من مرة في نفس الإيميل "
+                f"(مكرر لـ «{seen_in_message[digest]}»)."
+            )
+            continue
+        seen_in_message[digest] = att.filename
+        previous = db.find_attachment_by_hash(conn, digest)
+        if previous:
+            alerts.append(
+                f"• الملف «{att.filename}» مطابق تماماً لملف تمت أرشفته سابقاً:\n"
+                + _describe_previous(previous)
+            )
+            continue
+        keep.append(att)
+    return keep, alerts
+
+
+def _describe_previous(previous: dict) -> str:
+    return (
+        f"   الكتاب: {previous['title']}\n"
+        f"   القسم: {previous['department']} ({DIRECTION_LABELS.get(previous['direction'], '')})\n"
+        f"   تاريخ الإيميل السابق: {previous['email_date']:%Y-%m-%d %H:%M}\n"
+        f"   المسار: {previous['stored_path']}"
+    )
+
+
+def _alert_duplicates(msg: email_sync.FetchedMessage, alerts: list[str], outcome: str) -> None:
+    sender = msg.source_email if msg.direction == "incoming" else msg.dest_email
+    text = (
+        "⚠ تم العثور على مرفق مكرر — لا تطبعه مرة أخرى!\n\n"
+        f"الإيميل: {msg.subject or '(بدون موضوع)'}\n"
+        f"{'من' if msg.direction == 'incoming' else 'إلى'}: {sender}\n"
+        f"التاريخ: {msg.email_date:%Y-%m-%d %H:%M}\n\n"
+        + "\n\n".join(alerts)
+        + f"\n\n{outcome}"
+    )
+    logger.warning("Duplicate attachment(s) in uid=%s (%s): %s", msg.imap_uid, msg.imap_folder, alerts)
+    duplicate_alert.notify(text)
+
+
+def process_message(conn, client, model: str, storage_root: str, msg: email_sync.FetchedMessage) -> bool:
+    """Archives the message's attachments, skipping duplicates (with an alarm).
+    A letter is a duplicate when its number (العدد) and date, read from the
+    document, match a letter archived before; an individual attachment is also
+    dropped when its exact bytes were archived before. Returns True if a letter
+    was archived, False if it was skipped as a duplicate."""
+    attachments, alerts = _split_duplicates(conn, msg)
+    if not attachments:
+        _alert_duplicates(msg, alerts, "لم يتم حفظ هذا الإيميل لأن كل مرفقاته مكررة.")
+        return False
+    msg.attachments = attachments
+
     primary = classifier.pick_primary_attachment(msg.attachments)
-    base_title = classifier.generate_letter_title(client, model, primary, msg.subject)
+    base_title, letter_number, letter_date = classifier.analyze_letter(client, model, primary, msg.subject)
+    if letter_number and letter_date:
+        previous = db.find_letter_by_number(conn, letter_number, letter_date)
+        if previous:
+            alerts.insert(
+                0,
+                f"• الكتاب «{primary.filename}» بالعدد {letter_number} "
+                f"والتاريخ {letter_date:%Y-%m-%d} تمت أرشفته سابقاً:\n"
+                + _describe_previous(previous),
+            )
+            _alert_duplicates(msg, alerts, "لم يتم حفظ هذا الكتاب لأنه مكرر.")
+            return False
+    else:
+        logger.info("No letter number/date found in %s (uid=%s); duplicate check by number skipped",
+                    primary.filename, msg.imap_uid)
+    if alerts:
+        _alert_duplicates(msg, alerts, "تم حفظ بقية المرفقات فقط، ولم يُحفظ المكرر.")
+
     title = classifier.make_unique_title(
         conn, client, model, msg.department, msg.direction, base_title, primary
     )
@@ -42,8 +132,11 @@ def process_message(conn, client, model: str, storage_root: str, msg: email_sync
         imap_folder=msg.imap_folder,
         imap_uid=msg.imap_uid,
         attachments=result["attachments"],
+        letter_number=letter_number,
+        letter_date=letter_date,
     )
     logger.info("Archived letter: %s [%s/%s]", title, msg.direction, msg.department)
+    return True
 
 
 def run_sync_cycle(progress: Callable[[str], None] | None = None) -> int:
@@ -75,6 +168,13 @@ def _run_sync_cycle_locked(report: Callable[[str], None]) -> int:
     archived = 0
     failed_folders = []
     with db.get_connection() as conn:
+        try:
+            backfilled = db.backfill_attachment_hashes(conn, file_organizer.hash_file)
+            if backfilled:
+                logger.info("Computed content hashes for %d previously archived attachments", backfilled)
+        except Exception:
+            conn.rollback()
+            logger.exception("Backfilling attachment hashes failed")
         for folder, direction in folders:
             try:
                 archived += _sync_folder(conn, client, settings, folder, direction, report)
@@ -126,9 +226,11 @@ def _sync_folder(conn, client, settings, folder: str, direction: str, report: Ca
         # spending Gemini quota on it again.
         if msg.attachments and not db.letter_exists(conn, folder, msg.imap_uid):
             try:
-                process_message(conn, client, settings.gemini_model, settings.storage_root, msg)
-                archived += 1
-                report(f"تمت أرشفة: {msg.subject or msg.department}")
+                if process_message(conn, client, settings.gemini_model, settings.storage_root, msg):
+                    archived += 1
+                    report(f"تمت أرشفة: {msg.subject or msg.department}")
+                else:
+                    report(f"⚠ مرفق مكرر لم يُحفظ: {msg.subject or msg.department}")
             except Exception:
                 logger.exception("Failed to process message uid=%s in %s", msg.imap_uid, folder)
         # Save progress after every message so an interrupted scan resumes

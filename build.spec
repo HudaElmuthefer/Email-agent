@@ -10,6 +10,7 @@ hiddenimports = [
     "app.classifier",
     "app.config",
     "app.db",
+    "app.duplicate_alert",
     "app.email_sync",
     "app.file_organizer",
     "app.sync_service",

@@ -1,3 +1,4 @@
+import hashlib
 import re
 from pathlib import Path
 
@@ -15,6 +16,18 @@ def sanitize_path_component(name: str, max_len: int = 150) -> str:
         name = name.replace(ch, " ")
     name = re.sub(r"\s+", " ", name).strip(" .")
     return (name or "بدون اسم")[:max_len]
+
+
+def content_hash(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def hash_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _unique_path(path: Path) -> Path:
@@ -60,6 +73,7 @@ def store_single_attachment(
                 "original_filename": attachment.filename,
                 "stored_path": str(path),
                 "file_type": attachment.content_type,
+                "content_hash": content_hash(attachment.content),
             }
         ],
     }
@@ -93,6 +107,7 @@ def store_multiple_attachments(
                 "original_filename": att.filename,
                 "stored_path": str(path),
                 "file_type": att.content_type,
+                "content_hash": content_hash(att.content),
             }
         )
         if att is primary_attachment:
