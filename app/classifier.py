@@ -240,8 +240,13 @@ def normalize_letter_number(raw: str) -> str | None:
 
 
 def _parse_letter_date(raw: str) -> date | None:
+    """Parses the date Gemini returned. The prompt asks for YYYY-MM-DD, but
+    despite that some replies come back as YYYY/MM/DD; without this fallback
+    such a letter would silently skip the number+date duplicate check instead
+    of just the date separator being different."""
+    cleaned = (raw or "").translate(_DIGIT_TRANSLATION).strip().replace("/", "-")
     try:
-        return date.fromisoformat((raw or "").translate(_DIGIT_TRANSLATION).strip())
+        return date.fromisoformat(cleaned)
     except ValueError:
         return None
 

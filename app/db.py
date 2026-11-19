@@ -54,8 +54,10 @@ ALTER TABLE attachments ADD COLUMN IF NOT EXISTS content_hash TEXT;
 CREATE INDEX IF NOT EXISTS idx_attachments_content_hash ON attachments (content_hash);
 
 -- The letter's own number (العدد, digit groups only) and date as read from
--- the document; together they identify a letter, so a match means it was
--- already archived (and printed).
+-- the document; together with direction (and, for incoming mail, the sending
+-- department) they identify a letter, so a match means it was already
+-- archived (and printed). See find_letter_by_number for why the scope
+-- matters: different directions/departments keep independent number series.
 ALTER TABLE letters ADD COLUMN IF NOT EXISTS letter_number TEXT;
 ALTER TABLE letters ADD COLUMN IF NOT EXISTS letter_date DATE;
 CREATE INDEX IF NOT EXISTS idx_letters_number_date ON letters (letter_number, letter_date);
@@ -220,19 +222,34 @@ def find_attachment_by_hash(conn, content_hash: str) -> dict | None:
         return dict(row) if row else None
 
 
-def find_letter_by_number(conn, letter_number: str, letter_date: date) -> dict | None:
-    """Returns the earlier archived letter with this number and date, or None."""
+def find_letter_by_number(
+    conn, letter_number: str, letter_date: date, direction: str, department: str | None = None
+) -> dict | None:
+    """Returns the earlier archived letter with this number and date, or None.
+    Always scoped to the same direction: incoming and outgoing numbers come
+    from two unrelated sequences, so a match across directions is coincidence,
+    not a duplicate. For incoming mail it is also scoped to the same sending
+    department, since each external department keeps its own independent
+    number sequence (two different departments can coincidentally issue a
+    letter with the same number on the same date). Outgoing numbers are our
+    own single organization-wide sequence, so they are left unscoped by
+    department."""
+    clauses = ["letter_number = %s", "letter_date = %s", "direction = %s"]
+    params: list = [letter_number, letter_date, direction]
+    if direction == "incoming" and department:
+        clauses.append("department = %s")
+        params.append(department)
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            """
+            f"""
             SELECT title, department, direction, email_date, subject,
                    primary_file_path AS stored_path
             FROM letters
-            WHERE letter_number = %s AND letter_date = %s
+            WHERE {' AND '.join(clauses)}
             ORDER BY email_date
             LIMIT 1
             """,
-            (letter_number, letter_date),
+            params,
         )
         row = cur.fetchone()
         return dict(row) if row else None

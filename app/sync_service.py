@@ -76,9 +76,12 @@ def _alert_duplicates(msg: email_sync.FetchedMessage, alerts: list[str], outcome
 def process_message(conn, client, model: str, storage_root: str, msg: email_sync.FetchedMessage) -> bool:
     """Archives the message's attachments, skipping duplicates (with an alarm).
     A letter is a duplicate when its number (العدد) and date, read from the
-    document, match a letter archived before; an individual attachment is also
-    dropped when its exact bytes were archived before. Returns True if a letter
-    was archived, False if it was skipped as a duplicate."""
+    document, match a letter archived before in the same direction (and, for
+    incoming mail, from the same sending department — see
+    db.find_letter_by_number for why that scope matters); an individual
+    attachment is also dropped when its exact bytes were archived before.
+    Returns True if a letter was archived, False if it was skipped as a
+    duplicate."""
     attachments, alerts = _split_duplicates(conn, msg)
     if not attachments:
         _alert_duplicates(msg, alerts, "لم يتم حفظ هذا الإيميل لأن كل مرفقاته مكررة.")
@@ -88,7 +91,7 @@ def process_message(conn, client, model: str, storage_root: str, msg: email_sync
     primary = classifier.pick_primary_attachment(msg.attachments)
     base_title, letter_number, letter_date = classifier.analyze_letter(client, model, primary, msg.subject)
     if letter_number and letter_date:
-        previous = db.find_letter_by_number(conn, letter_number, letter_date)
+        previous = db.find_letter_by_number(conn, letter_number, letter_date, msg.direction, msg.department)
         if previous:
             alerts.insert(
                 0,
